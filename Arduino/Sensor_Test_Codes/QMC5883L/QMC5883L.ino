@@ -6,23 +6,24 @@ QMC5883LCompass compass;
 void setup() {
   Serial.begin(9600);
   Wire.begin();
-  compass.init();
+  Serial.println("QMC5883L during startup...");
 
-  Serial.println("QMC5883L 初期化完了");
+  compass.init();
+  Serial.println("QMC5883L initialization complete");
 }
 
 void loop() {
-  compass.read();
+  compass.read();                     // データ更新
 
-  int x = compass.getX();
-  int y = compass.getY();
-  int z = compass.getZ();
-  int heading = compass.getAzimuth();
+  int x = compass.getX();             // x軸磁場
+  int y = compass.getY();             // y軸磁場
+  int z = compass.getZ();             // z軸磁場
+  int heading = compass.getAzimuth(); // 方位角(0～359度)
 
   Serial.print("X: "); Serial.print(x);
-  Serial.print(" Y: "); Serial.print(y);
-  Serial.print(" Z: "); Serial.print(z);
-  Serial.print(" 方位（度）: "); Serial.println(heading);
+  Serial.print(", Y: "); Serial.print(y);
+  Serial.print(", Z: "); Serial.print(z);
+  Serial.print(" | 方位(度): "); Serial.println(heading);
 
   delay(500);
 }

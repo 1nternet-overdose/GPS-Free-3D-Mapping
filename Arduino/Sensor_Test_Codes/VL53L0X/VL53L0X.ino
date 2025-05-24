@@ -6,25 +6,26 @@ Adafruit_VL53L0X lox = Adafruit_VL53L0X();
 void setup() {
   Serial.begin(9600);
   Wire.begin();
+  Serial.println("VL53L0X during startup...");
 
   if (!lox.begin()) {
-    Serial.println("VL53L0X センサが見つかりません。配線を確認してください。");
+    Serial.println("VL53L0X not found");
     while (1);
   }
 
-  Serial.println("VL53L0X 初期化成功");
+  Serial.println("VL53L0X initialization complete");
 }
 
 void loop() {
   VL53L0X_RangingMeasurementData_t measure;
-  lox.rangingTest(&measure, false); // trueでデバッグ出力
+  lox.rangingTest(&measure, false); // 測距開始(第2引数trueでデバッグ表示)
 
-  if (measure.RangeStatus != 4) {  // VL53L0X_ERROR_NONE
+  if (measure.RangeStatus != 4) {
     Serial.print("距離: ");
     Serial.print(measure.RangeMilliMeter);
     Serial.println(" mm");
   } else {
-    Serial.println("測定エラー");
+    Serial.println("ERROR: 測定範囲外");
   }
 
   delay(500);
