@@ -8,7 +8,7 @@ void setup() {
   size(600, 600);
   background(0);
 
-  // シリアルポート自動選択（必要に応じて修正）
+  // シリアルポート自動選択
   printArray(Serial.list());
   myPort = new Serial(this, Serial.list()[0], 9600);
   myPort.bufferUntil('\n');
@@ -26,10 +26,10 @@ void draw() {
   noStroke();
   rect(-width/2, -height/2, width, height);
 
-  // プロット（点描）
+  // プロット(点描)
   stroke(0, 255, 0);
   strokeWeight(3);
-  point(x / 10.0, -y / 10.0);  // 反転はY軸を上向きに
+  point(x / 10.0, -y / 10.0); // 反転はY軸を上向きに
 }
 
 void serialEvent(Serial myPort) {
@@ -42,7 +42,7 @@ void serialEvent(Serial myPort) {
         x = int(values[0]);
         y = int(values[1]);
       } catch (Exception e) {
-        println("データ変換エラー: " + e);
+        println("ERROR: " + e);
       }
     }
   }
