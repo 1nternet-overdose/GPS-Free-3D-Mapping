@@ -5,6 +5,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import ddf.minim.analysis.*;
 
 Serial myPort;
 
@@ -62,6 +63,20 @@ float posX = 400, posY = 200;
 float headingDeg = 0;
 boolean shouldStep = false;
 
+// FFTに関する設定
+final int FFT_N = 128;                // サンプル数
+float[] fftBuffer = new float[FFT_N]; // FFT用バッファ
+int fftIndex = 0;                     // インデックス
+float accEnergy = 0;                  // 加速度信号のエネルギー量
+float dominantFreq = 0;               // 卓越周波数
+FFT fft;
+
+// EKFに関する設定
+float theta = 0;                // 姿勢角(傾き角など)
+float gyroBias = 0;             // バイアス(ゼロ点誤差)
+float dt = 0.02;                // サンプリング周期(秒)：20ms≒50Hz
+float P = 1, Q = 0.01, R = 0.5; // EKFパラメータ：P=誤差共分散(初期値), Q=プロセスノイズ(モデルの信頼度). R=観測ノイズ(センサ値の信頼度)
+
 // 画面・ポート初期化：GUI構築，ファイル書き出し
 void setup() {
   size(800, 400);
@@ -69,11 +84,13 @@ void setup() {
   String portName = Serial.list()[0];
   myPort = new Serial(this, portName, 115200);
   myPort.bufferUntil('\n');
-  
+
   output = createWriter(filename);        // センサログファイル
   featureOut = createWriter(featureFile); // 特微量ログファイル
-  featureOut.println("time,period,accMax,accMin,accAmp,zuptDuration,estimatedLength,heading");
-  
+  featureOut.println("time,period,accMax,accMin,accAmp,zuptDuration,accEnergy,dominantFreq,estimatedLength,heading");
+
+  fft = new FFT(FFT_N, 50);
+
   background(255);
   stroke(0);
   fill(0);
@@ -92,7 +109,6 @@ void draw() {
     float headingRad = radians(headingDeg);
     float dx = cos(headingRad) * lastStepLength * 100;
     float dy = sin(headingRad) * lastStepLength * 100;
-
     float newX = posX + dx;
     float newY = posY - dy;
 
@@ -118,21 +134,59 @@ void serialEvent(Serial p) {
   output.println(line);
   latestData = sensorData;
 
-  // accMag計算：√(x^2+y^2+z^2)/16384
   float ax = float(sensorData[1]);
   float ay = float(sensorData[2]);
   float az = float(sensorData[3]);
+  float gx = float(sensorData[4]);
+  float gy = float(sensorData[5]);
+  float gz = float(sensorData[6]);
+  float mx = float(sensorData[7]);
+  float my = float(sensorData[8]);
+  float mz = float(sensorData[9]);
+
+  // accMag計算：√(x^2+y^2+z^2)/16384
   float accMag = sqrt(ax * ax + ay * ay + az * az) / 16384.0;
   currentAccMag = accMag;
+
+  // FFT：歩行周期の周波数検出
+  fftBuffer[fftIndex % FFT_N] = accMag;
+  fftIndex++;
+
+  if (fftIndex >= FFT_N) {
+    accEnergy = 0;
+    for (int i = 0; i < FFT_N; i++) accEnergy += fftBuffer[i] * fftBuffer[i];
+    accEnergy *= dt;
+
+    fft.forward(fftBuffer);
+    float maxVal = -1;
+    int maxIndex = -1;
+    for (int i = 1; i < fft.specSize(); i++) {
+      if (fft.getBand(i) > maxVal) {
+        maxVal = fft.getBand(i);
+        maxIndex = i;
+      }
+    }
+    dominantFreq = fft.indexToFreq(maxIndex);
+  }
+
+  // EKF：磁気センサとジャイロによるヨー角推定
+  float magYaw = degrees(atan2(my, mx));
+  float gyroYawRate = gz / 131.0; // MPU6050の感度係数
+
+  theta += (gyroYawRate - gyroBias) * dt;
+  P += Q;
+  float y = magYaw - theta;
+  float K = P / (P + R);
+  theta += K * y;
+  P *= (1 - K);
+  headingDeg = theta;
 
   // accMax/accMin更新：振幅検出
   accMax = max(accMax, accMag);
   accMin = min(accMin, accMag);
 
   // ZUPT検出(静止状態判定)
-  if (ZUPT_flag && zuptStartTime == 0) {
-    zuptStartTime = millis();
-  }
+  if (ZUPT_flag && zuptStartTime == 0) zuptStartTime = millis();
   if (!ZUPT_flag && zuptStartTime > 0) {
     zuptDuration = millis() - zuptStartTime;
     zuptStartTime = 0;
@@ -182,30 +236,23 @@ void serialEvent(Serial p) {
     filtered[i1] > 0.274 &&
     now - lastStepTime > minStepInterval
   ) {
-    
+
     // ステップ検出成立
     int stepInterval = now - lastStepTime;
     float accAmp = accMax - accMin;
-    
+
     // 歩幅推定
-    float predictedLength = sendForPrediction(stepInterval, accMax, accMin, accAmp, zuptDuration);
+    float predictedLength = sendForPrediction(stepInterval, accMax, accMin, accAmp, zuptDuration, accEnergy, dominantFreq);
 
     // 各種更新
     lastStepLength = predictedLength;
     totalDistance += lastStepLength;
     stepCount++;
     lastStepTime = now;
-    headingDeg = float(sensorData[sensorData.length - 1]);
     shouldStep = true;
 
     // 特徴量ログ書き出し
-    featureOut.println(now + "," + stepInterval + "," +
-                       nf(accMax, 1, 4) + "," +
-                       nf(accMin, 1, 4) + "," +
-                       nf(accAmp, 1, 4) + "," +
-                       zuptDuration + "," +
-                       nf(predictedLength, 1, 3) + "," +
-                       headingDeg);
+    featureOut.println(now + "," + stepInterval + "," + nf(accMax, 1, 4) + "," + nf(accMin, 1, 4) + "," + nf(accAmp, 1, 4) + "," + zuptDuration + "," + nf(accEnergy, 1, 3) + "," + nf(dominantFreq, 1, 2) + "," + nf(predictedLength, 1, 3) + "," + headingDeg);
     featureOut.flush();
 
     accMax = -9999;
@@ -213,12 +260,12 @@ void serialEvent(Serial p) {
     zuptDuration = 0;
   }
 
-  // accIndex更新：環状バッファ
+  // accIndex更新：リングバッファ
   accIndex = (accIndex + 1) % N;
 }
 
 // 機械学習API呼び出し
-float sendForPrediction(float period, float accMax, float accMin, float accAmp, int zuptDuration) {
+float sendForPrediction(float period, float accMax, float accMin, float accAmp, int zuptDuration, float accEnergy, float dominantFreq) {
   try {
     // 特徴量をJSON形式で作成
     JSONObject json = new JSONObject();
@@ -227,6 +274,8 @@ float sendForPrediction(float period, float accMax, float accMin, float accAmp, 
     json.setFloat("accMin", accMin);
     json.setFloat("accAmp", accAmp);
     json.setInt("zuptDuration", zuptDuration);
+    json.setFloat("accEnergy", accEnergy);
+    json.setFloat("dominantFreq", dominantFreq);
 
     // HTTP POSTでFlaskへ送信
     URL url = new URL("http://127.0.0.1:5000/predict");
