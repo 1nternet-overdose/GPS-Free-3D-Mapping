@@ -1,141 +1,139 @@
+// --- 必要ライブラリ ---
 #include <Wire.h>
-
-// 各種センサライブラリのインクルード
 #include <MPU6050.h>
 #include <QMC5883LCompass.h>
 #include <VL53L0X.h>
 #include <BME280I2C.h>
+#include <math.h>
 
-// センサインスタンス生成
+// --- センサインスタンス ---
 MPU6050 mpu;
 QMC5883LCompass compass;
-VL53L0X vl53;
+VL53L0X tof;
 BME280I2C bme;
 
-// 地磁気センサキャリブレーション用変数定義：地磁気安定性確認，ドリフト判定
-bool magReady = false;
-int xStableCount = 0, yStableCount = 0, zStableCount = 0;
-const int magStableThreshold = 10;
+// --- 加速度・角速度の物理量：float型 ---
+float accMag;
 
-const int magDriftThreshold = 30; // [%]
-const int magDriftRequired = 30;
-int magDriftCount = 0;
-const int MAG_HISTORY_LEN = 10;
-float magHistory[MAG_HISTORY_LEN];
-float magAvg = 0;
-int magIndex = 0;
+// --- ZUPT検出フラグ ---
+bool zuptFlag = false;
+unsigned long lastZuptTime = 0;
+const int zuptWindow = 200; // ms
+const float zuptThreshold = 0.02; // ±G判定範囲（ノルム）
 
-int minX = 32767, maxX = -32768;
-int minY = 32767, maxY = -32768;
-int minZ = 32767, maxZ = -32768;
+// --- センサ値増幅のための各種倍率 ---
+const float accelGain = 2.0;    // 加速度の倍率
+const float gyroGain = 2.0;     // ジャイロの倍率
+// const float magGain  = 1.5;  // 地磁気の倍率
 
-// 各センサ初期化処理
+// --- ガウスフィルタ ---
+const int KERNEL_SIZE = 5;
+const float gaussianKernel[KERNEL_SIZE] = {0.06136, 0.24477, 0.38774, 0.24477, 0.06136};
+
+float axHistory[KERNEL_SIZE] = {0}, ayHistory[KERNEL_SIZE] = {0}, azHistory[KERNEL_SIZE] = {0};
+float gxHistory[KERNEL_SIZE] = {0}, gyHistory[KERNEL_SIZE] = {0}, gzHistory[KERNEL_SIZE] = {0};
+float mxHistory[KERNEL_SIZE] = {0}, myHistory[KERNEL_SIZE] = {0};
+float distHistory[KERNEL_SIZE] = {0}, presHistory[KERNEL_SIZE] = {0};
+
+float applyGaussianFilter(float newVal, float* buffer, const float* kernel, int size) {
+  for (int i = 0; i < size - 1; i++) buffer[i] = buffer[i + 1];
+  buffer[size - 1] = newVal;
+  float result = 0.0;
+  for (int i = 0; i < size; i++) result += buffer[i] * kernel[i];
+  return result;
+}
+
 void setup() {
   Serial.begin(115200);
   Wire.begin();
 
-  mpu.initialize();
-  compass.init();
-  vl53.init();
-  vl53.setTimeout(500);
-  vl53.startContinuous();
-  bme.begin();
+  mpu.initialize(); // MPU6050 初期化
+  compass.init();   // QMC5883L 初期化
+  compass.setCalibration(-696, 1446, -1803, 98, -636, 1445);
+
+  tof.setTimeout(500);
+  // VL53L0X 初期化と連続測定モード開始
+  if (!tof.init()) {
+    Serial.println("VL53L0X failed");
+    while (1);
+  }
+  tof.startContinuous();
+
+  // BME280 初期化
+  while (!bme.begin()) delay(500);
 }
 
 void loop() {
-  // MPU6050：加速度・ジャイロ取得
-  int16_t ax, ay, az, gx, gy, gz;
-  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  // --- MPU6050 ---
+  int16_t ax_raw, ay_raw, az_raw;
+  int16_t gx_raw, gy_raw, gz_raw;
 
-  // QMC5883L：地磁気取得
-  compass.read();
-  int mx = compass.getX();
-  int my = compass.getY();
-  int mz = compass.getZ();
-  int heading = compass.getAzimuth();
+  mpu.getAcceleration(&ax_raw, &ay_raw, &az_raw); // 加速度(x, y, z)取得
+  mpu.getRotation(&gx_raw, &gy_raw, &gz_raw);
 
-  // VL53L0X：距離取得
-  int distance = vl53.readRangeContinuousMillimeters();
-  if (vl53.timeoutOccurred()) distance = -1;
+  float ax = ay_raw / 16384.0;
+  float ay = ax_raw / 16384.0;
+  float az = az_raw / 16384.0;
+  float gx = gy_raw / 131.0;
+  float gy = gx_raw / 131.0;
+  float gz = gz_raw / 131.0;
 
-  // BME280：温度・湿度・気圧取得
-  float temp, hum, pres;
-  bme.read(pres, temp, hum);
+  float axF = applyGaussianFilter(ax, axHistory, gaussianKernel, KERNEL_SIZE) * accelGain;
+  float ayF = applyGaussianFilter(ay, ayHistory, gaussianKernel, KERNEL_SIZE) * accelGain;
+  float azF = applyGaussianFilter(az, azHistory, gaussianKernel, KERNEL_SIZE) * accelGain;
 
-  // 地磁気ベクトルの大きさ：√(x^2+y^2+z^2)
-  float magNorm = sqrt(mx * mx + my * my + mz * mz);
+  float gxF = applyGaussianFilter(gx, gxHistory, gaussianKernel, KERNEL_SIZE) * gyroGain;
+  float gyF = applyGaussianFilter(gy, gyHistory, gaussianKernel, KERNEL_SIZE) * gyroGain;
+  float gzF = applyGaussianFilter(gz, gzHistory, gaussianKernel, KERNEL_SIZE) * gyroGain;
 
-  // キャリブレーション状態管理(初期化完了条件)：min/maxの安定判定
-  if (!magReady) {
-    if (mx < minX) {
-      minX = mx; xStableCount = 0;
-    } else if (mx > maxX) {
-      maxX = mx; xStableCount = 0;
+  accMag = sqrt(ax * ax + ay * ay + az * az);
+
+  // --- ZUPT 判定 ---
+  unsigned long now = millis();
+  if (accMag > (2.7 - zuptThreshold) && accMag < (2.7 + zuptThreshold)) {
+    if (now - lastZuptTime > zuptWindow) {
+      zuptFlag = true;
+      lastZuptTime = now;
     } else {
-      xStableCount++;
+      zuptFlag = false;
     }
-
-    if (my < minY) {
-      minY = my; yStableCount = 0;
-    } else if (my > maxY) {
-      maxY = my; yStableCount = 0;
-    } else {
-      yStableCount++;
-    }
-
-    if (mz < minZ) {
-      minZ = mz; zStableCount = 0;
-    } else if (mz > maxZ) {
-      maxZ = mz; zStableCount = 0;
-    } else {
-      zStableCount++;
-    }
-
-    if (xStableCount >= magStableThreshold &&
-        yStableCount >= magStableThreshold &&
-        zStableCount >= magStableThreshold) {
-      magReady = true;
-    }
-
   } else {
-    // 移動平均の更新：magNormの履歴を保持し平均値を算出
-    magAvg -= magHistory[magIndex] / MAG_HISTORY_LEN;
-    magHistory[magIndex] = magNorm;
-    magAvg += magNorm / MAG_HISTORY_LEN;
-    magIndex = (magIndex + 1) % MAG_HISTORY_LEN;
-
-    // ドリフト判定：現在値と平均値の差分検出
-    if (abs(magNorm - magAvg) > magAvg * (magDriftThreshold / 100.0)) {
-      magDriftCount++;
-    } else {
-      magDriftCount = max(magDriftCount - 1, 0);
-    }
-
-    // 再キャリブレーションの実行条件と処理
-    if (magDriftCount >= magDriftRequired) {
-      magReady = false;
-      xStableCount = yStableCount = zStableCount = 0;
-      minX = minY = minZ = 32767;
-      maxX = maxY = maxZ = -32768;
-      magDriftCount = 0;
-    }
+    zuptFlag = false;
+    lastZuptTime = now;
   }
 
-  // タイムスタンプ
-  unsigned long t = millis();
+  // --- QMC5883L ---
+  compass.read();
+  int mx = -compass.getX();
+  int my = compass.getZ();
 
-  // シリアル出力(CSV形式)
-  Serial.print(t); Serial.print(",");
-  Serial.print(ax); Serial.print(","); Serial.print(ay); Serial.print(","); Serial.print(az); Serial.print(",");
-  Serial.print(gx); Serial.print(","); Serial.print(gy); Serial.print(","); Serial.print(gz); Serial.print(",");
-  Serial.print(mx); Serial.print(","); Serial.print(my); Serial.print(","); Serial.print(mz); Serial.print(",");
-  Serial.print(distance); Serial.print(",");
-  Serial.print(pres, 0); Serial.print(",");
-  Serial.print(temp, 1); Serial.print(",");
-  Serial.print(hum, 1); Serial.print(",");
-  Serial.print(magReady ? 1 : 0); Serial.print(",");
-  Serial.println(heading); // Azimuth (0-360 degrees)
+  float mxF = applyGaussianFilter(mx, mxHistory, gaussianKernel, KERNEL_SIZE);
+  float myF = applyGaussianFilter(my, myHistory, gaussianKernel, KERNEL_SIZE);
+  float magYaw = atan2(myF, mxF) * 180.0 / PI;
+  if (magYaw < 0) magYaw += 360.0;
 
-  // 10Hzサンプリング：100ms周期で送信
-  delay(100);
+  // --- VL53L0X ---
+  int distance = tof.readRangeContinuousMillimeters();  // mm単位
+  float distF = applyGaussianFilter((float)(distance - 20), distHistory, gaussianKernel, KERNEL_SIZE);
+
+  // --- BME280 ---
+  float temp, hum, pres;
+  bme.read(pres, temp, hum);  // 気圧・温度・湿度
+  float presF = applyGaussianFilter(pres, presHistory, gaussianKernel, KERNEL_SIZE);
+
+  // --- 送信 ---
+  Serial.print("A,");   // パケット識別子
+  Serial.print(axF, 3); Serial.print(",");
+  Serial.print(ayF, 3); Serial.print(",");
+  Serial.print(azF, 3); Serial.print(",");
+  Serial.print(gxF, 3); Serial.print(",");
+  Serial.print(gyF, 3); Serial.print(",");
+  Serial.print(gzF, 3); Serial.print(",");
+  Serial.print(accMag, 3); Serial.print(",");
+  Serial.print(zuptFlag ? 1 : 0); Serial.print(",");
+  Serial.print(magYaw, 2); Serial.print(",");
+  Serial.print(distF, 2); Serial.print(",");
+  Serial.print(presF, 2); Serial.println();
+
+  delay(50);
 }
