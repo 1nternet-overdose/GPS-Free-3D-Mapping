@@ -9,13 +9,6 @@ import ddf.minim.*;
 Serial myPort;
 PrintWriter logWriter;
 
-// --- 自己位置・角度・歩数関連 ---
-float posX = 0, posY = 0, posZ = 0;
-float theta = 0;
-float stepLength = 0.6;
-int stepCount = 0;
-float totalDistance = 0.0;
-
 // --- センサデータ ---
 float accMag;
 float magYaw;
@@ -24,36 +17,33 @@ float pressure;
 boolean zupt = false;
 String climbDirection = "";
 
-// --- センサ履歴（時系列バッファ） ---
-final int MAX_HISTORY = 300;
-ArrayList<Float> accXHistory = new ArrayList<Float>();
-ArrayList<Float> accYHistory = new ArrayList<Float>();
-ArrayList<Float> accZHistory = new ArrayList<Float>();
-ArrayList<Float> pressureHistory = new ArrayList<Float>();
+// --- 処理遅延 ---
+int arduinoSentTime = 0;
+int systemDelay = 0;
 
-// --- コピー用（並列処理などで使用） ---
-ArrayList<Float> accXHistoryCopy, accYHistoryCopy, accZHistoryCopy;
-
-// --- ZUPT（静止判定）用 ---
-final int ZUPT_THRESHOLD_FRAME = 10;
-final float ZUPT_DELTA_THRESHOLD = 0.02;
-final int ZUPT_STABLE_WINDOW = 10;
-int zuptFrame = 0;
-ArrayList<Float> accMagWindow = new ArrayList<Float>();
+// --- 自己位置・角度・歩数関連 ---
+float posX = 0, posY = 0, posZ = 0;   // 自己位置
+float theta = 0;                      // 進行方向（角度）
+float stepLength = 17.2;
+int stepCount = 0;
+int climbUpCount = 0;
+int climbDownCount = 0;
+float totalDistance = 0.0;
+int lastStepTime = 0;                 // 前回ステップ検出時刻
+int stepCooldown = 0;
+int climbCooldown = 0;
+boolean stepDetected = false;
 
 // --- 軌跡・障害物ログ ---
 ArrayList<PVector> trajectory = new ArrayList<PVector>();
 ArrayList<PVector> obstacles = new ArrayList<PVector>();
 
-// --- 障害物表示ウィンドウ ---
-ObstacleWindow obstacleWin;
-
-// --- クールダウン変数 ---
-int stepCooldown = 0;
-int climbCooldown = 0;
-
-// --- 前回ステップ検出時刻 ---
-int lastStepTime = 0;
+// --- ZUPT（静止判定）関連 ---
+final int ZUPT_THRESHOLD_FRAME = 10;
+final float ZUPT_DELTA_THRESHOLD = 0.02;
+final int ZUPT_STABLE_WINDOW = 10;
+int zuptFrame = 0;
+ArrayList<Float> accMagWindow = new ArrayList<Float>();
 
 // --- ビープ音関連 ---
 Minim minim;
@@ -67,30 +57,79 @@ int beepStartTime = 0;
 int beepInterval = 1000;
 int beepDuration = 50;
 
+// --- センサ履歴用時系列バッファ ---
+final int MAX_HISTORY = 300;
+ArrayList<Float> accXHistory = new ArrayList<Float>();
+ArrayList<Float> accYHistory = new ArrayList<Float>();
+ArrayList<Float> accZHistory = new ArrayList<Float>();
+ArrayList<Float> pressureHistory = new ArrayList<Float>();
+
+// --- コピー用（並列処理などで使用） ---
+ArrayList<Float> accXHistoryCopy, accYHistoryCopy, accZHistoryCopy;
+
+// --- 起動直後のウォームアップ制御 ---
+int warmupTime = 3000;        // ウォームアップ期間（ms単位）
+int startTime;                // 起動時刻
+boolean isWarmingUp = true;   // ウォームアップ中フラグ
+
+// --- EKF関連グローバル変数 ---
+float[] ekfX = new float[9];                        // 状態ベクトル
+float[][] P = new float[9][9];                      // 共分散行列
+float[][] Q = new float[9][9];                      // プロセスノイズ
+float[][] R = new float[9][9];                      // 観測ノイズ
+float measuredGyroX, measuredGyroY, measuredGyroZ;  // ジャイロ観測
+float measuredDistance;                             // ToF距離観測
+float prevX = 0, prevY = 0, prevZ = 0;              // EKF推定の前フレーム位置
+
+// --- 視点操作用変数 ---
+float rotX = radians(-30);   // X軸 -30度 初期値
+float rotY = radians(-60);   // Y軸 -60度 初期値
+float zoom = 620;            // Z軸方向の初期位置
+float prevMouseX, prevMouseY;
+boolean isDragging = false;
+float camOffsetX = 0;
+float camOffsetY = 0;
+boolean isPanning = false;
+
 void setup() {
+  // --- ウィンドウ初期化 ---
   size(800, 800, P3D);
   myPort = new Serial(this, Serial.list()[0], 115200);
   myPort.bufferUntil('\n');
   background(255);
   textSize(14);
 
+  // --- ログファイル生成 ---
   String fileName = "motion_log_" + year() + nf(month(), 2) + nf(day(), 2) + "_" + nf(hour(), 2) + nf(minute(), 2) + ".csv";
   logWriter = createWriter(fileName);
-  logWriter.println("time,posX,posY,posZ,theta,stepCount,totalDistance,climbDirection,zupt,accX,accY,accZ");
+  logWriter.println("time,posX,posY,posZ,theta,stepCount,totalDistance,climbDirection,climbUpCount,climbDownCount,zupt,accX,accY,accZ,pressure,arduinoTime,delay");
   
-  // --- Minim の初期化 ---
+  // --- Minim初期化 ---
   minim = new Minim(this);
   out = minim.getLineOut();
   beepTone = new BeepTone(1000, 0.5, out.sampleRate());
   out.addSignal(beepTone);
-  beepTone.setAmplitude(0);  // 初期はミュート
+  beepTone.setAmplitude(0);   // 初期状態：ミュート
+  
+  startTime = millis();       // 起動時刻記録
+  
+  ekfInit();  // EKFの初期化
 
-  // obstacleWin = new ObstacleWindow();
-  // String[] args = {"ObstacleWindow"};
-  // PApplet.runSketch(args, obstacleWin);
 }
 
 void draw() {
+  // --- ウォームアップ表示（起動後3秒間） ---
+  if (isWarmingUp && millis() - startTime < warmupTime) {
+    background(255);
+    fill(0);
+    textAlign(CENTER, CENTER);
+    text("Warming Up...", width / 2, height / 2);
+    return;
+  } else {
+    isWarmingUp = false;
+  }
+
+  // --- 履歴バッファコピー ---
   synchronized (accXHistory) {
     accXHistoryCopy = new ArrayList<Float>(accXHistory);
   }
@@ -101,14 +140,17 @@ void draw() {
     accZHistoryCopy = new ArrayList<Float>(accZHistory);
   }
 
+  // --- 3D描画 ---
   background(255);
   lights();
-  translate(width / 2, height / 2, 620);
-  rotateX(radians(-30));
-  rotateY(radians(-60));
-  rotateZ(radians(0));
-  drawGridBox(10, 50);
+  translate(width / 2 + camOffsetX, height / 2 + camOffsetY, zoom);
+  rotateX(rotX);
+  rotateY(rotY);
+  rotateZ(0);
+  scale(1, 1, -1);
+  drawGridBox(20, 100);
 
+  // --- 歩行軌跡 ---
   stroke(0, 0, 255);
   strokeWeight(1.5);
   noFill();
@@ -120,6 +162,7 @@ void draw() {
   }
   endShape();
 
+  // --- 情報表示 ---
   fill(0);
   hint(DISABLE_DEPTH_TEST);
   camera();
@@ -128,7 +171,8 @@ void draw() {
   text("Step Count: " + stepCount, 20, 40);
   text("Total Distance: " + nf(totalDistance, 1, 2) + " m", 20, 60);
   text("Climb Direction: " + climbDirection, 20, 80);
-  //text("ToF Distance: " + distance + " mm", 20, 100);
+  text("Climb Up Count: " + climbUpCount, 20, 100);
+  text("Climb Down Count: " + climbDownCount, 20, 120);
 
   drawWave(accZHistoryCopy, color(0, 200, 255), 140, "Z axis (Step Acc)");
   drawWave(accYHistoryCopy, color(0, 255, 100), 200, "Y axis (Climb Acc)");
@@ -139,24 +183,66 @@ void draw() {
 
   detectMotionAndLog();
   
-  // --- ToFデバッグ表示と音制御 ---
+  // --- EKFによる位置推定 ---
+  float[] Z = new float[9];
+  Z[3] = measuredGyroX;
+  Z[4] = measuredGyroY;
+  Z[5] = measuredGyroZ;
+  Z[6] = posZ;
+  Z[7] = ekfX[8];
+  Z[8] = measuredDistance;
+
+  float dt = 0.017; // 約60FPS
+
+  ekfPredict(dt);
+  ekfUpdate(Z);
+
+  // --- 相対移動として描画座標を更新 ---
+  if (stepDetected) {
+    float angleRad = radians(theta);  // EKFからの角度
+    float dx = stepLength * sin(angleRad);
+    float dz = stepLength * cos(angleRad);
+
+    posX += dx;
+    posZ += dz;
+
+    trajectory.add(new PVector(posX, posY, posZ));
+
+    prevX = ekfX[0];
+    prevY = ekfX[1];
+    prevZ = ekfX[2];
+  }
+  
+  // --- ToF距離によるビープ音制御 ---
+  // ウォームアップ中はミュート
+  if (isWarmingUp) {
+    beepTone.setAmplitude(0);
+    isBeeping = false;
+    return;
+  }
+
   fill(0);
   textAlign(LEFT);
   if (distance < validDistanceMin || distance > validDistanceMax) {
-    text("ToF Distance: OUT OF RANGE", 20, 100);
+    text("ToF Distance: OUT OF RANGE", 20, 140);
     beepTone.setAmplitude(0);     // ミュート
     isBeeping = false;
     beepStartTime = millis();     // リセット：連続誤検知防止
   } else {
-    text("ToF Distance: " + nf(distance / 10.0, 1, 1) + " cm", 20, 100);
+    text("ToF Distance: " + nf(distance / 10.0, 1, 1) + " cm", 20, 140);
 
-    // 音の間隔：距離に応じて条件分岐）
+    // 音の間隔：距離に応じて条件分岐
+    if (distance <= 200) {
+      // ～20cm未満：連続音
+      beepTone.setAmplitude(0.5);
+      isBeeping = true;
+      return;
+    }
+    
     int interval;
-    if (distance <= 100) {          // ～10cm未満：連続
-      interval = 100;
-    } else if (distance <= 300) {   // ～30cm：速く
+    if (distance <= 500) {          // ～50cm：速く
       interval = 400;
-    } else if (distance <= 500) {   // ～50cm：遅く
+    } else if (distance <= 1000) {  // ～1m：遅く
       interval = 1000;
     } else {                        // ～2m：それ以上は鳴らさない
       beepTone.setAmplitude(0);
@@ -179,12 +265,52 @@ void draw() {
   }
 }
 
+void mousePressed() {
+  prevMouseX = mouseX;
+  prevMouseY = mouseY;
+
+  // Shiftキー押しながらでパン、それ以外は回転
+  isPanning = keyPressed && keyCode == SHIFT;
+  isDragging = true;
+}
+
+void mouseReleased() {
+  isDragging = false;
+}
+
+void mouseDragged() {
+  if (isDragging) {
+    float dx = mouseX - prevMouseX;
+    float dy = mouseY - prevMouseY;
+
+    if (isPanning) {
+      camOffsetX += dx;
+      camOffsetY += dy;
+    } else {
+      rotY += radians(dx) * 0.5;
+      rotX += radians(dy) * 0.5;
+    }
+
+    prevMouseX = mouseX;
+    prevMouseY = mouseY;
+  }
+}
+
+void mouseWheel(processing.event.MouseEvent event) {
+  float e = event.getCount();
+  zoom -= e * 20;
+  zoom = constrain(zoom, 100, 2000);  // 適切な範囲に制限
+}
+
+// --- センサ値の受信処理 ---
 void serialEvent(Serial myPort) {
+  // Arduinoからのセンサデータを受信・解析（パース）
   String inData = trim(myPort.readStringUntil('\n'));
   if (inData == null || !inData.startsWith("A")) return;
   String[] vals = split(inData, ',');
-  if (vals.length < 12) return;
+  if (vals.length < 13) return;
 
+  // 以下を取得
   try {
     float accX = float(vals[1]);
     float accY = float(vals[2]);
@@ -193,6 +319,14 @@ void serialEvent(Serial myPort) {
     magYaw = float(vals[9]);
     distance = int(vals[10]);
     pressure = float(vals[11]);
+    arduinoSentTime = int(float(vals[12]));  // Arduino送信時刻
+    int receiveTime = millis();              // Processing受信時刻
+    systemDelay = receiveTime - arduinoSentTime;
+
+    measuredGyroX = float(vals[7]);
+    measuredGyroY = float(vals[8]);
+    measuredGyroZ = float(vals[9]);
+    measuredDistance = int(vals[12]);        // mm単位
 
     theta = magYaw;
 
@@ -228,6 +362,10 @@ void serialEvent(Serial myPort) {
       if (accZHistory.size() > MAX_HISTORY) accZHistory.remove(0);
       accZHistory.add(accZ);
     }
+    synchronized (pressureHistory) {
+      if (pressureHistory.size() > MAX_HISTORY) pressureHistory.remove(0);
+      pressureHistory.add(pressure);
+    }
 
     if (distance > 20 && distance < 3000) {
       float dx = cos(radians(theta)) * distance / 100.0;
@@ -244,7 +382,12 @@ void serialEvent(Serial myPort) {
   }
 }
 
+// --- 歩行・昇降検出とログ出力 ---
 void detectMotionAndLog() {
+  if (isWarmingUp) return;    // ウォームアップ中は処理停止
+  
+  climbDirection = "Stable";  // デフォルト状態は常にStable
+
   int N = 10;
   if (accZHistoryCopy.size() < N || accXHistoryCopy.size() < N || accYHistoryCopy.size() < N) return;
 
@@ -260,7 +403,7 @@ void detectMotionAndLog() {
 
     float deltaZ = maxZ - minZ;
 
-    if (deltaZ > 1.0) {
+    if (deltaZ > 1.4) {
       stepLength = estimateStepLength(accZHistoryCopy, deltaZ);
       float dz = stepLength * cos(radians(theta));
       float dx = stepLength * sin(radians(theta));
@@ -269,59 +412,72 @@ void detectMotionAndLog() {
       totalDistance += stepLength;
       stepCount++;
       
-      trajectory.add(new PVector(posX, posY, posZ));
+    // --- 歩行検出フラグを立てる ---
+    stepDetected = true;
       
       println("Step Detected: " + stepCount + " (" + nf(stepLength, 1, 2) + " m)");
       
-      stepCooldown = 15;
+      stepCooldown = 20;
+    } else {
+    stepDetected = false;  // 検出されなかったらfalseに
     }
   } else if (stepCooldown > 0) {
     stepCooldown--;
+    stepDetected = false;  // クールダウン中は検出なし
   }
 
-  // --- 昇降検出：X軸 ---
-  if (!zupt && climbCooldown == 0 && accXHistoryCopy.size() >= 64) {
-    float maxX = -Float.MAX_VALUE;
-    float minX = Float.MAX_VALUE;
-    float sumX = 0;
+  // --- 昇降検出：Y軸 ---
+  if (!zupt && climbCooldown == 0 && accYHistoryCopy.size() >= 3) {
+    float prevY = accYHistoryCopy.get(accYHistoryCopy.size() - 2);
+    float currentY = accYHistoryCopy.get(accYHistoryCopy.size() - 1);
+    float deltaY = currentY - prevY;
+    
+    float prevP = pressureHistory.get(pressureHistory.size() - 2);
+    float currentP = pressureHistory.get(pressureHistory.size() - 1);
+    float deltaPressure = currentP - prevP;
 
-    for (int i = accXHistoryCopy.size() - N; i < accXHistoryCopy.size(); i++) {
-      float val = accXHistoryCopy.get(i);
-      maxX = max(maxX, val);
-      minX = min(minX, val);
-      sumX += val;
+    float prevPrevY = accYHistoryCopy.get(accYHistoryCopy.size() - 3);
+    float prevDeltaY = prevY - prevPrevY;
+
+    float threshold = 0.6;  // 昇降判定の変化しきい値
+
+    //println("deltaY: " + nf(deltaY, 1, 3) + " / prevDeltaY: " + nf(prevDeltaY, 1, 3));
+    println("prevP: " + nf(prevP, 1, 3) + " / currentP: " + nf(currentP, 1, 3));
+    println("deltaPressure: " + nf(deltaPressure, 1, 3));
+
+    float stepHeight = 1.0;
+    if (accYHistoryCopy.size() >= 64) {
+      float[] fftInput = new float[64];
+      for (int i = 0; i < 64; i++) {
+        fftInput[i] = accYHistoryCopy.get(accYHistoryCopy.size() - 64 + i);
+      }
+      float freq = estimateFrequency(fftInput, 30.0);
+      stepHeight = constrain(map(freq, 0.5, 3.0, 0.05, 0.2), 0.05, 0.2);
     }
 
-    float deltaX = maxX - minX;
-    float avgX = sumX / N;
-
-    println("avgX: " + nf(avgX, 1, 3));
-
-    // FFTで昇降周期を推定
-    float[] fftInput = new float[64];
-    for (int i = 0; i < 64; i++) {
-      fftInput[i] = accXHistoryCopy.get(accXHistoryCopy.size() - 64 + i);
-    }
-    float freq = estimateFrequency(fftInput, 30.0);  // 30Hzサンプリング
-
-    // 周期に応じて昇降量を調整：速い動きほど大きく昇降
-    float stepHeight = constrain(map(freq, 0.5, 3.0, 0.05, 0.2), 0.05, 0.2);
-
-    if (deltaX > 0.5) {
-      if (avgX < 1.0) {
+    // --- 判定処理 ---
+    if (abs(deltaY) > threshold) {
+      if (prevDeltaY < -0.2) {
         climbDirection = "Climbing";
         posY -= stepHeight;
-        trajectory.add(new PVector(posX, posY, posZ));
+        climbUpCount++;
         println("Climb Detected ↑ (" + nf(stepHeight, 1, 3) + " m)");
-      } else if (avgX > 1.5) {
+        println("deltaY: " + nf(deltaY, 1, 3) + " / prevDeltaY: " + nf(prevDeltaY, 1, 3));
+        println("deltaPressure: " + nf(deltaPressure, 1, 3));
+      } else if (prevDeltaY > -0.2) {
         climbDirection = "Descending";
         posY += stepHeight;
-        trajectory.add(new PVector(posX, posY, posZ));
+        climbDownCount++;
         println("Climb Detected ↓ (" + nf(stepHeight, 1, 3) + " m)");
+        println("deltaY: " + nf(deltaY, 1, 3) + " / prevDeltaY: " + nf(prevDeltaY, 1, 3));
+        println("deltaPressure: " + nf(deltaPressure, 1, 3));
       } else {
         climbDirection = "Stable";
       }
-      climbCooldown = 15;
+      climbCooldown = 50;
+      trajectory.add(new PVector(posX, posY, posZ));
+    } else {
+      climbDirection = "Stable";
     }
   } else if (climbCooldown > 0) {
     climbCooldown--;
@@ -340,10 +496,15 @@ void detectMotionAndLog() {
                     stepCount + "," +
                     nf(totalDistance, 1, 2) + "," +
                     climbDirection + "," +
+                    climbUpCount + "," +
+                    climbDownCount + "," +
                     zupt + "," +
                     nf(latestX, 1, 3) + "," +
                     nf(latestY, 1, 3) + "," +
-                    nf(latestZ, 1, 3));
+                    nf(latestZ, 1, 3) + "," +
+                    nf(pressure, 1, 2) + "," +
+                    arduinoSentTime + "," +
+                    systemDelay);
   logWriter.flush();
 }
 
@@ -372,6 +533,7 @@ float estimateStepLength(ArrayList<Float> accZHistory, float deltaZ) {
   return (ampComponent * 0.4 + freqComponent * 0.3 + timeComponent * 0.3);
 }
 
+// --- 歩行周期に基づく歩幅の推定 ---
 float estimateFrequency(float[] signal, float fps) {
   FFT fft = new FFT(signal.length, fps);
   fft.forward(signal);
@@ -437,13 +599,7 @@ void drawCompass(float angleDeg, int centerX, int centerY, int size) {
   // 回転角度表示
   fill(0);
   textAlign(CENTER, CENTER);
-  text(nf(angleDeg, 1, 1) + "°", 0, 0);
-  
-  // 方位表示（非表示）
-  // text("N", 0, -size + 10);
-  // text("S", 0, size - 10);
-  // text("W", -size + 10, 0);
-  // text("E", size - 10, 0);
+  text(nf(angleDeg, 1, 2) + "°", 0, 0);
   
   popMatrix();
 }
@@ -491,55 +647,191 @@ class BeepTone implements AudioSignal {
   }
 }
 
-// --- サブウィンドウ：障害物3D表示 ---
-public class ObstacleWindow extends PApplet {
-  public void settings() {
-    size(600, 600, P3D);
+// --- EKF 初期化 ---
+void ekfInit(){
+  for(int i=0;i<9;i++){
+    ekfX[i]=0; // 修正: 状態ベクトル名を ekfX に統一
+    for(int j=0;j<9;j++){
+      P[i][j]=(i==j)?1.0:0.0;
+      Q[i][j]=(i==j)?0.01:0.0;
+      R[i][j]=(i==j)?0.1:0.0;
+    }
   }
+}
 
-  public void setup() {
-    surface.setTitle("障害物3D表示");
-  }
-  
-  public void draw() {
-    background(240);
-    lights();
+// --- 状態遷移関数（非線形） ---
+float[] f(float[] X, float dt){
+  float[] Xnew = X.clone();
+  Xnew[0]+=X[3]*dt;
+  Xnew[1]+=X[4]*dt;
+  Xnew[2]+=X[5]*dt;
+  Xnew[6]+=measuredGyroX*dt;
+  Xnew[7]+=measuredGyroY*dt;
+  Xnew[8]+=measuredGyroZ*dt;
+  return Xnew;
+}
 
-    // 一人称視点カメラ
-    float scale = 20.0;
-    float eyeX = posX * scale;
-    float eyeY = -posY * scale;
-    float eyeZ = -posZ * scale + 50;
+// --- 観測関数（非線形） ---
+float[] h(float[] X){
+  float[] Zpred = new float[9];
+  Zpred[0]=0; Zpred[1]=0; Zpred[2]=0;
+  Zpred[3]=measuredGyroX;
+  Zpred[4]=measuredGyroY;
+  Zpred[5]=measuredGyroZ;
+  Zpred[6]=X[2];
+  Zpred[7]=X[8];
+  Zpred[8]=measuredDistance;
+  return Zpred;
+}
 
-    float centerX = eyeX + 100 * sin(radians(theta));
-    float centerY = eyeY;
-    float centerZ = eyeZ + 100 * cos(radians(theta));
+// --- ヤコビアンF ---
+float[][] calcJacobianF(float dt){
+  float[][] F = identityMatrix(9);
+  F[0][3]=dt; F[1][4]=dt; F[2][5]=dt;
+  return F;
+}
 
-    camera(eyeX, eyeY, eyeZ, centerX, centerY, centerZ, 0, 1, 0);
+// --- ヤコビアンH ---
+float[][] calcJacobianH(){
+  float[][] H = new float[9][9];
+  H[3][3]=1; H[4][4]=1; H[5][5]=1;
+  H[6][2]=1; H[7][8]=1;
+  return H;
+}
 
-    // 座標軸ガイド
-    strokeWeight(2);
-    stroke(255, 0, 0); line(0, 0, 0, 50, 0, 0); // X軸：赤
-    stroke(0, 255, 0); line(0, 0, 0, 0, 50, 0); // Y軸：緑
-    stroke(0, 0, 255); line(0, 0, 0, 0, 0, 50); // Z軸：青
+// --- EKF予測 ---
+void ekfPredict(float dt){
+  float[][] F = calcJacobianF(dt);
+  ekfX = f(ekfX, dt);       // 修正
+  P = matrixAdd(matrixMultiply(matrixMultiply(F, P), transpose(F)), Q);
+}
 
-    fill(180, 50, 50);
-    stroke(100);
-    synchronized (obstacles) {
-      for (PVector obs : obstacles) {
-        pushMatrix();
-        translate(obs.x * scale, -obs.y * scale, -obs.z * scale);
-        box(10);
-        popMatrix();
+// --- EKF更新 ---
+void ekfUpdate(float[] Z){
+  float[][] H = calcJacobianH();
+  float[] Zpred = h(ekfX);  // 修正
+  float[] y = new float[9];
+  for (int i=0; i<9; i++) y[i] = Z[i] - Zpred[i];
+
+  float[][] S = matrixAdd(matrixMultiply(matrixMultiply(H, P), transpose(H)), R);
+  float[][] K = matrixMultiply(matrixMultiply(P, transpose(H)), inverseMatrix(S));
+
+  for (int i=0; i<9; i++)
+    for (int j=0; j<9; j++)
+      ekfX[i] += K[i][j] * y[j];
+
+  float[][] I = identityMatrix(9);
+  P = matrixMultiply(matrixSubtract(I, matrixMultiply(K, H)), P);
+}
+
+// --- 行列の掛け算（A × B） ---
+float[][] matrixMultiply(float[][] A, float[][] B) {
+  int aRows = A.length;
+  int aCols = A[0].length;
+  int bCols = B[0].length;
+
+  float[][] result = new float[aRows][bCols];
+
+  for (int i = 0; i < aRows; i++) {
+    for (int j = 0; j < bCols; j++) {
+      result[i][j] = 0;
+      for (int k = 0; k < aCols; k++) {
+        result[i][j] += A[i][k] * B[k][j];
       }
     }
-
-    // HUD表示
-    hint(DISABLE_DEPTH_TEST);
-    camera(); // デフォルトカメラに戻してテキスト表示
-    fill(0);
-    textSize(12);
-    text("Obstacle Count: " + obstacles.size(), 20, 20);
-    hint(ENABLE_DEPTH_TEST);
   }
+  return result;
+}
+
+// --- 行列の加算（A + B） ---
+float[][] matrixAdd(float[][] A, float[][] B) {
+  int rows = A.length;
+  int cols = A[0].length;
+  float[][] result = new float[rows][cols];
+  for (int i = 0; i < rows; i++) {
+    for (int j = 0; j < cols; j++) {
+      result[i][j] = A[i][j] + B[i][j];
+    }
+  }
+  return result;
+}
+
+// --- 行列の減算（A - B） ---
+float[][] matrixSubtract(float[][] A, float[][] B) {
+  int rows = A.length;
+  int cols = A[0].length;
+  float[][] result = new float[rows][cols];
+  for (int i = 0; i < rows; i++) {
+    for (int j = 0; j < cols; j++) {
+      result[i][j] = A[i][j] - B[i][j];
+    }
+  }
+  return result;
+}
+
+// --- 行列の逆行列を求める（ガウス・ジョルダン法） ---
+float[][] inverseMatrix(float[][] A) {
+  int n = A.length;
+  float[][] augmented = new float[n][2 * n];
+
+  // 拡張行列を作る [A | I]
+  for (int i = 0; i < n; i++) {
+    for (int j = 0; j < n; j++) {
+      augmented[i][j] = A[i][j];
+    }
+    augmented[i][i + n] = 1.0;
+  }
+
+  // ガウス・ジョルダン消去法
+  for (int i = 0; i < n; i++) {
+    float pivot = augmented[i][i];
+    if (abs(pivot) < 1e-6) {
+      println("逆行列エラー：ピボットがゼロです");
+      return identityMatrix(n);  // 単位行列で代用
+    }
+    for (int j = 0; j < 2 * n; j++) {
+      augmented[i][j] /= pivot;
+    }
+    for (int k = 0; k < n; k++) {
+      if (k != i) {
+        float factor = augmented[k][i];
+        for (int j = 0; j < 2 * n; j++) {
+          augmented[k][j] -= factor * augmented[i][j];
+        }
+      }
+    }
+  }
+
+  // 逆行列部分を抽出
+  float[][] inverse = new float[n][n];
+  for (int i = 0; i < n; i++) {
+    for (int j = 0; j < n; j++) {
+      inverse[i][j] = augmented[i][j + n];
+    }
+  }
+
+  return inverse;
+}
+
+// --- 行列の転置 ---
+float[][] transpose(float[][] A) {
+  int rows = A.length;
+  int cols = A[0].length;
+  float[][] result = new float[cols][rows];
+  
+  for (int i = 0; i < rows; i++) {
+    for (int j = 0; j < cols; j++) {
+      result[j][i] = A[i][j];
+    }
+  }
+  return result;
+}
+
+// --- 単位行列（Identity Matrix）生成関数 ---
+float[][] identityMatrix(int n) {
+  float[][] I = new float[n][n];
+  for (int i = 0; i < n; i++) {
+    I[i][i] = 1.0;
+  }
+  return I;
 }
